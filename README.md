@@ -25,11 +25,11 @@ aws cloudformation deploy \
 
 ## パラメータ
 
-| パラメータ | デフォルト値 | 説明 |
-|-----------|-------------|------|
-| `NotificationEmail` | （必須） | 変更通知の送信先メールアドレス |
-| `TargetServices` | `AMAZON_CONNECT,CLOUDFRONT` | 監視対象の AWS サービス名（カンマ区切り） |
-| `TargetRegions` | `ap-northeast-1,GLOBAL` | 監視対象のリージョン（カンマ区切り） |
+| パラメータ          | デフォルト値                | 説明                                      |
+| ------------------- | --------------------------- | ----------------------------------------- |
+| `NotificationEmail` | （必須）                    | 変更通知の送信先メールアドレス            |
+| `TargetServices`    | `AMAZON_CONNECT,CLOUDFRONT` | 監視対象の AWS サービス名（カンマ区切り） |
+| `TargetRegions`     | `ap-northeast-1,GLOBAL`     | 監視対象のリージョン（カンマ区切り）      |
 
 ## クリーンアップ
 
