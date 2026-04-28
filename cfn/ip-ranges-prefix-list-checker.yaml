@@ -116,19 +116,25 @@ Resources:
           TARGET_SERVICES = os.environ["TARGET_SERVICES"].split(",")
           TARGET_REGIONS = os.environ["TARGET_REGIONS"].split(",")
 
+          def to_key(entry):
+              return (entry["service"], entry["region"], entry["ip_prefix"])
+
           def lambda_handler(event, context):
               # 1. Download ip-ranges.json
               url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
               with urllib.request.urlopen(url) as resp:
                   ip_ranges = json.loads(resp.read())
 
-              # 2. Filter by target services and regions
-              current = sorted(set(
-                  p["ip_prefix"]
-                  for p in ip_ranges["prefixes"]
-                  if p["service"] in TARGET_SERVICES
-                  and p["region"] in TARGET_REGIONS
-              ))
+              # 2. Filter by target services and regions (keep service/region info)
+              current = sorted(
+                  [
+                      {"service": p["service"], "region": p["region"], "ip_prefix": p["ip_prefix"]}
+                      for p in ip_ranges["prefixes"]
+                      if p["service"] in TARGET_SERVICES
+                      and p["region"] in TARGET_REGIONS
+                  ],
+                  key=lambda x: to_key(x),
+              )
 
               # 3. Get previous prefixes from S3
               try:
@@ -138,27 +144,31 @@ Resources:
                   previous = []
 
               # 4. Detect diff
-              added = sorted(set(current) - set(previous))
-              removed = sorted(set(previous) - set(current))
+              current_keys = set(to_key(e) for e in current)
+              previous_keys = set(to_key(e) for e in previous)
+              added_keys = sorted(current_keys - previous_keys)
+              removed_keys = sorted(previous_keys - current_keys)
 
               # 5. Notify if changed
-              if added or removed:
-                  message = (
-                      "ip-ranges.json has been updated.\n\n"
-                      f"Services: {', '.join(TARGET_SERVICES)}\n"
-                      f"Regions: {', '.join(TARGET_REGIONS)}\n\n"
-                  )
-                  if added:
-                      message += "Added:\n" + "\n".join(f"  + {p}" for p in added) + "\n\n"
-                  if removed:
-                      message += "Removed:\n" + "\n".join(f"  - {p}" for p in removed) + "\n\n"
-                  message += f"Total prefixes: {len(current)}\n"
-                  message += "Please update the Prefix List accordingly."
+              if added_keys or removed_keys:
+                  lines = ["ip-ranges.json has been updated.\n"]
+                  if added_keys:
+                      lines.append("Added:")
+                      for svc, region, prefix in added_keys:
+                          lines.append(f"  + {prefix}  ({svc} / {region})")
+                      lines.append("")
+                  if removed_keys:
+                      lines.append("Removed:")
+                      for svc, region, prefix in removed_keys:
+                          lines.append(f"  - {prefix}  ({svc} / {region})")
+                      lines.append("")
+                  lines.append(f"Total prefixes: {len(current)}")
+                  lines.append("Please update the Prefix List accordingly.")
 
                   sns.publish(
                       TopicArn=SNS_TOPIC_ARN,
                       Subject="[ip-ranges.json] Prefix change detected",
-                      Message=message,
+                      Message="\n".join(lines),
                   )
 
               # 6. Save current prefixes to S3
@@ -172,8 +182,8 @@ Resources:
               return {
                   "statusCode": 200,
                   "prefixes": len(current),
-                  "added": added,
-                  "removed": removed,
+                  "added": [f"{p} ({s} / {r})" for s, r, p in added_keys],
+                  "removed": [f"{p} ({s} / {r})" for s, r, p in removed_keys],
               }
 
   # Allow AmazonIpSpaceChanged SNS to invoke Lambda
