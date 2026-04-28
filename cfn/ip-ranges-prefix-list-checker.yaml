@@ -77,6 +77,10 @@ Resources:
                 Resource: !Sub "${PrefixStoreBucket.Arn}/ip-ranges/*"
               - Effect: Allow
                 Action:
+                  - s3:ListBucket
+                Resource: !GetAtt PrefixStoreBucket.Arn
+              - Effect: Allow
+                Action:
                   - sns:Publish
                 Resource: !Ref NotificationTopic
 
