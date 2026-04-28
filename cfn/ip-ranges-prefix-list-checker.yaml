@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Detect ip-ranges.json updates via SNS and notify when relevant IP prefixes change.
+  Deploy this stack in us-east-1 (required for AmazonIpSpaceChanged SNS topic).
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive change notifications.
+  TargetServices:
+    Type: CommaDelimitedList
+    Default: "AMAZON_CONNECT,CLOUDFRONT"
+    Description: Comma-separated list of AWS service names to monitor in ip-ranges.json.
+  TargetRegions:
+    Type: CommaDelimitedList
+    Default: "ap-northeast-1,GLOBAL"
+    Description: Comma-separated list of AWS regions to monitor.
+
+Resources:
+  # S3 bucket to store previous IP ranges for diff detection
+  PrefixStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SNS topic for change notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: IP Ranges Change Notification
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IpRangesCheckerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${PrefixStoreBucket.Arn}/ip-ranges/*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # Lambda function
+  IpRangesCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref PrefixStoreBucket
+          S3_KEY: ip-ranges/previous_prefixes.json
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          TARGET_SERVICES: !Join [",", !Ref TargetServices]
+          TARGET_REGIONS: !Join [",", !Ref TargetRegions]
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+          import boto3
+
+          s3 = boto3.client("s3")
+          sns = boto3.client("sns")
+
+          S3_BUCKET = os.environ["S3_BUCKET"]
+          S3_KEY = os.environ["S3_KEY"]
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+          TARGET_SERVICES = os.environ["TARGET_SERVICES"].split(",")
+          TARGET_REGIONS = os.environ["TARGET_REGIONS"].split(",")
+
+          def lambda_handler(event, context):
+              # 1. Download ip-ranges.json
+              url = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+              with urllib.request.urlopen(url) as resp:
+                  ip_ranges = json.loads(resp.read())
+
+              # 2. Filter by target services and regions
+              current = sorted(set(
+                  p["ip_prefix"]
+                  for p in ip_ranges["prefixes"]
+                  if p["service"] in TARGET_SERVICES
+                  and p["region"] in TARGET_REGIONS
+              ))
+
+              # 3. Get previous prefixes from S3
+              try:
+                  obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
+                  previous = json.loads(obj["Body"].read())
+              except s3.exceptions.NoSuchKey:
+                  previous = []
+
+              # 4. Detect diff
+              added = sorted(set(current) - set(previous))
+              removed = sorted(set(previous) - set(current))
+
+              # 5. Notify if changed
+              if added or removed:
+                  message = (
+                      "ip-ranges.json has been updated.\n\n"
+                      f"Services: {', '.join(TARGET_SERVICES)}\n"
+                      f"Regions: {', '.join(TARGET_REGIONS)}\n\n"
+                  )
+                  if added:
+                      message += "Added:\n" + "\n".join(f"  + {p}" for p in added) + "\n\n"
+                  if removed:
+                      message += "Removed:\n" + "\n".join(f"  - {p}" for p in removed) + "\n\n"
+                  message += f"Total prefixes: {len(current)}\n"
+                  message += "Please update the Prefix List accordingly."
+
+                  sns.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject="[ip-ranges.json] Prefix change detected",
+                      Message=message,
+                  )
+
+              # 6. Save current prefixes to S3
+              s3.put_object(
+                  Bucket=S3_BUCKET,
+                  Key=S3_KEY,
+                  Body=json.dumps(current),
+                  ContentType="application/json",
+              )
+
+              return {
+                  "statusCode": 200,
+                  "prefixes": len(current),
+                  "added": added,
+                  "removed": removed,
+              }
+
+  # Allow AmazonIpSpaceChanged SNS to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IpRangesCheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: arn:aws:sns:us-east-1:806199016981:AmazonIpSpaceChanged
+
+  # Subscribe Lambda to AmazonIpSpaceChanged
+  IpSpaceChangedSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: arn:aws:sns:us-east-1:806199016981:AmazonIpSpaceChanged
+      Protocol: lambda
+      Endpoint: !GetAtt IpRangesCheckerFunction.Arn
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the IP ranges checker Lambda function
+    Value: !GetAtt IpRangesCheckerFunction.Arn
+  BucketName:
+    Description: S3 bucket storing previous IP ranges
+    Value: !Ref PrefixStoreBucket
+  NotificationTopicArn:
+    Description: SNS topic ARN for change notifications
+    Value: !Ref NotificationTopic
